@@ -1,7 +1,7 @@
 # ESP32 CYD Gamma Spectrometer
 
 
-An ESP32 gamma pulse spectrometer for the **ESP32-2432S028R Cheap Yellow Display** and an external **WM8782 I2S ADC audio capture board**.
+An ESP32 gamma pulse spectrometer for the **ESP32-2432S028R Cheap Yellow Display** and an external **I2S ADC audio capture board**. May work with other ESP32 board with minor modifications.
 
 The sketch reads a fast 32-bit stereo I2S stream from the ADC module, detects pulses from a photomultiplier front-end, estimates pulse height, and builds a live pulse-height spectrum on the CYD touchscreen.
 
@@ -20,8 +20,8 @@ The scintillation head used for this build is an **XP2011B photomultiplier** cou
 
 - ESP32-2432S028R / Cheap Yellow Display (CYD) with ILI9341 display and XPT2046 touch controller
 - Theremino PMT Adapter
-- XP2011B photomultiplier with NaI(Tl) scintillation crystal
-- WM8782 I2S ADC audio capture board
+- A photomultiplier scintillation crystal (Screenshots have been made with XP2011B with NaI(Tl) crystal)
+- WM8782 I2S ADC audio capture board or other I2S ADC (see https://www.pschatzmann.ch/home/2021/11/17/using-a-i2s-adc-audio-i2s-capture-card-module-with-an-esp32/ )
 - Optional small speaker on the CYD speaker connector
 
 The ADC module is expected to be the **I2S master** and the ESP32 is configured as an **I2S slave**. Set the ADC module jumper so its `CLOCK OUT` feeds its own `MCLK IN`.
