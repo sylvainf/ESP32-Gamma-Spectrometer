@@ -26,7 +26,7 @@ The scintillation head used for this build is an **XP2011B photomultiplier** cou
 
 The ADC module is expected to be the **I2S master** and the ESP32 is configured as an **I2S slave**. Set the ADC module jumper so its `CLOCK OUT` feeds its own `MCLK IN`.
 
-Theremino PMT is powered by USB (same USB Powerbank for ESP32 / I2S CAN and Theremino) and output signal is connected to I2S ADC througt a (maybe unecessary) 1uF capacitor.
+Theremino PMT is powered by USB (same USB Powerbank for ESP32 / I2S CAN and Theremino) and output signal is connected to I2S ADC left input.
 
 ## I2S wiring
 
