@@ -4,6 +4,7 @@
 #endif
 #define LGFX_USE_V1
 #include <LovyanGFX.hpp>
+#include <Preferences.h>
 #include <driver/i2s_std.h>
 #include <math.h>
 
@@ -28,7 +29,9 @@ static constexpr int PIN_LED_B = 17;
 static constexpr int PIN_BUZZER = 26;
 static constexpr bool RGB_LED_ACTIVE_LOW = true;
 static constexpr uint8_t RGB_LED_PWM_BITS = 8;
-static constexpr uint16_t RGB_LED_PWM_FREQ = 1000;
+// Keep the RGB LED PWM above the audible range. At 1 kHz, the CYD audio path
+// can pick up LED current modulation when CPS changes after pulses.
+static constexpr uint16_t RGB_LED_PWM_FREQ = 40000;
 static constexpr uint8_t BEEP_PWM_BITS = 8;
 static constexpr uint16_t BEEP_PWM_FREQ = 2400;
 static constexpr uint8_t BEEP_PWM_DUTY = 128;
@@ -134,6 +137,7 @@ static constexpr uint16_t C_GREEN = 0x07E0;
 static constexpr uint16_t C_YELLOW = 0xFFE0;
 static constexpr uint16_t C_ORANGE = 0xFD20;
 static constexpr uint16_t C_RED = 0xF800;
+static constexpr uint16_t C_CYAN = 0x07FF;
 
 static constexpr uint8_t CHANNELS = 2;
 static constexpr size_t I2S_FRAMES = 512;
@@ -141,6 +145,9 @@ static constexpr uint16_t MAX_PULSE_SAMPLES = 256;
 static constexpr uint16_t PRE_TRIGGER_SAMPLES = 10;
 static constexpr uint16_t REARM_SAMPLES = 4;
 static constexpr uint16_t HISTOGRAM_BINS = 192;
+static constexpr uint8_t MAX_PEAK_MARKERS = 6;
+static constexpr uint8_t PEAK_MIN_DISTANCE_BINS = 6;
+static constexpr uint8_t PEAK_SHOULDER_SPAN = 4;
 static constexpr uint16_t SCOPE_COLUMNS = 320;
 static constexpr uint16_t SCOPE_SAMPLES_PER_COLUMN = 4;
 static constexpr uint8_t BASELINE_SHIFT = 12;
@@ -155,19 +162,27 @@ enum ViewMode {
 };
 
 struct RuntimeSettings {
-  float spectrumMaxFraction = 0.05f;
+  float spectrumMaxFraction = 0.8f;
   float thresholdFraction = 0.007f;
   uint8_t sampleRateIndex = 1;
   uint16_t pulseSamples = 48;
   uint8_t selectedChannel = 0;
   int8_t pulsePolarity = 1;
+  bool spectrumLogX = false;
   bool spectrumLogCounts = false;
+  bool showHistogram = true;
+  bool showSmoothCurve = true;
+  bool showEnergy = false;
   bool lowPassEnabled = false;
   bool hysteresisEnabled = true;
   bool trapezoidEnabled = true;
   bool beepEnabled = false;
   uint8_t trapRiseSamples = TRAP_RISE_DEFAULT;
   uint8_t trapGapSamples = TRAP_GAP_DEFAULT;
+  uint16_t calibBin1 = 50;
+  uint16_t calibBin2 = 100;
+  float calibEnergy1 = 200.0f;
+  float calibEnergy2 = 400.0f;
 };
 
 struct Rect {
@@ -180,11 +195,14 @@ struct Rect {
 static RuntimeSettings settings;
 static ViewMode viewMode = VIEW_SPECTRUM;
 static uint8_t settingsPage = 0;
+static bool spectrumSettingsSaved = false;
+static uint32_t spectrumSettingsSavedUntilMs = 0;
 
 static int32_t i2sFrames[I2S_FRAMES * CHANNELS];
 static int32_t pulseBuffer[MAX_PULSE_SAMPLES];
 static int32_t preTrigger[PRE_TRIGGER_SAMPLES];
 static uint32_t histogram[HISTOGRAM_BINS];
+static uint32_t smoothedHistogram[HISTOGRAM_BINS];
 static int32_t scopeMin[SCOPE_COLUMNS];
 static int32_t scopeMax[SCOPE_COLUMNS];
 
@@ -216,6 +234,7 @@ static bool redrawRequested = true;
 static bool wasTouching = false;
 static uint32_t blueFlashUntilMs = 0;
 static uint32_t beepUntilMs = 0;
+static bool beeperPwmAttached = false;
 
 enum DetectorState {
   WAITING_FOR_PULSE,
@@ -241,6 +260,61 @@ static int32_t histogramFullScaleCounts() {
     maxFraction = settings.thresholdFraction * 1.2f;
   }
   return static_cast<int32_t>(2147483647.0f * maxFraction);
+}
+
+static void clampSpectrumSettings() {
+  if (settings.calibBin1 >= HISTOGRAM_BINS) settings.calibBin1 = HISTOGRAM_BINS - 1;
+  if (settings.calibBin2 >= HISTOGRAM_BINS) settings.calibBin2 = HISTOGRAM_BINS - 1;
+  if (settings.calibEnergy1 < 0.0f) settings.calibEnergy1 = 0.0f;
+  if (settings.calibEnergy2 < 0.0f) settings.calibEnergy2 = 0.0f;
+  if (settings.calibEnergy1 > 9999.0f) settings.calibEnergy1 = 9999.0f;
+  if (settings.calibEnergy2 > 9999.0f) settings.calibEnergy2 = 9999.0f;
+  if (!settings.showHistogram && !settings.showSmoothCurve) settings.showHistogram = true;
+}
+
+static bool calibrationValid() {
+  return settings.calibBin1 != settings.calibBin2 &&
+         fabsf(settings.calibEnergy1 - settings.calibEnergy2) >= 0.1f;
+}
+
+static float energyFromBin(float bin) {
+  if (!calibrationValid()) return bin;
+  const float slope = (settings.calibEnergy2 - settings.calibEnergy1) /
+                      static_cast<float>(settings.calibBin2 - settings.calibBin1);
+  return settings.calibEnergy1 + (bin - static_cast<float>(settings.calibBin1)) * slope;
+}
+
+static void loadSpectrumPreferences() {
+  Preferences prefs;
+  if (!prefs.begin("cydspec", true)) return;
+  settings.spectrumLogX = prefs.getBool("logx", settings.spectrumLogX);
+  settings.spectrumLogCounts = prefs.getBool("logy", settings.spectrumLogCounts);
+  settings.showHistogram = prefs.getBool("bars", settings.showHistogram);
+  settings.showSmoothCurve = prefs.getBool("curve", settings.showSmoothCurve);
+  settings.showEnergy = prefs.getBool("energy", settings.showEnergy);
+  settings.calibBin1 = static_cast<uint16_t>(prefs.getUInt("bin1", settings.calibBin1));
+  settings.calibBin2 = static_cast<uint16_t>(prefs.getUInt("bin2", settings.calibBin2));
+  settings.calibEnergy1 = prefs.getFloat("kev1", settings.calibEnergy1);
+  settings.calibEnergy2 = prefs.getFloat("kev2", settings.calibEnergy2);
+  prefs.end();
+  clampSpectrumSettings();
+}
+
+static void saveSpectrumPreferences() {
+  Preferences prefs;
+  if (!prefs.begin("cydspec", false)) return;
+  prefs.putBool("logx", settings.spectrumLogX);
+  prefs.putBool("logy", settings.spectrumLogCounts);
+  prefs.putBool("bars", settings.showHistogram);
+  prefs.putBool("curve", settings.showSmoothCurve);
+  prefs.putBool("energy", settings.showEnergy);
+  prefs.putUInt("bin1", settings.calibBin1);
+  prefs.putUInt("bin2", settings.calibBin2);
+  prefs.putFloat("kev1", settings.calibEnergy1);
+  prefs.putFloat("kev2", settings.calibEnergy2);
+  prefs.end();
+  spectrumSettingsSaved = true;
+  spectrumSettingsSavedUntilMs = millis() + 1200;
 }
 
 static uint32_t pulseWindowUs() {
@@ -438,14 +512,8 @@ static void setupStatusLed() {
 }
 
 static void setupBeeper() {
-#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
-  ledcAttach(PIN_BUZZER, BEEP_PWM_FREQ, BEEP_PWM_BITS);
-  ledcWrite(PIN_BUZZER, 0);
-#else
-  ledcSetup(3, BEEP_PWM_FREQ, BEEP_PWM_BITS);
-  ledcAttachPin(PIN_BUZZER, 3);
-  ledcWrite(3, 0);
-#endif
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
 }
 
 static void writeBeeper(uint8_t duty) {
@@ -456,9 +524,44 @@ static void writeBeeper(uint8_t duty) {
 #endif
 }
 
+static void attachBeeperPwm() {
+  if (beeperPwmAttached) return;
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+  ledcAttach(PIN_BUZZER, BEEP_PWM_FREQ, BEEP_PWM_BITS);
+#else
+  ledcSetup(3, BEEP_PWM_FREQ, BEEP_PWM_BITS);
+  ledcAttachPin(PIN_BUZZER, 3);
+#endif
+  beeperPwmAttached = true;
+  writeBeeper(0);
+}
+
+static void stopBeeper() {
+  if (!beeperPwmAttached && beepUntilMs == 0) return;
+
+  beepUntilMs = 0;
+  if (beeperPwmAttached) {
+    writeBeeper(0);
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && ESP_ARDUINO_VERSION_MAJOR >= 3
+    ledcDetach(PIN_BUZZER);
+#else
+    ledcDetachPin(PIN_BUZZER);
+#endif
+    beeperPwmAttached = false;
+  }
+  pinMode(PIN_BUZZER, OUTPUT);
+  digitalWrite(PIN_BUZZER, LOW);
+}
+
+static void startBeeper() {
+  attachBeeperPwm();
+  beepUntilMs = millis() + BEEP_MS;
+  writeBeeper(BEEP_PWM_DUTY);
+}
+
 static void updateBeeper() {
   if (!settings.beepEnabled || static_cast<int32_t>(beepUntilMs - millis()) <= 0) {
-    writeBeeper(0);
+    stopBeeper();
   }
 }
 
@@ -480,10 +583,7 @@ static void updateStatusLed() {
     return;
   }
 
-  uint8_t r = 0;
-  uint8_t g = 0;
-  cpsRedGreen(pulsesPerSecond, r, g);
-  writeStatusLed(r, g, 0);
+  writeStatusLed(0, 0, 0);
 }
 
 static void beginPulseCapture(int32_t firstPulseSample) {
@@ -506,8 +606,7 @@ static void finishPulseCapture() {
   lastPulseMs = millis();
   blueFlashUntilMs = lastPulseMs + BLUE_PULSE_FLASH_MS;
   if (settings.beepEnabled) {
-    beepUntilMs = lastPulseMs + BEEP_MS;
-    writeBeeper(BEEP_PWM_DUTY);
+    startBeeper();
   }
 
   int32_t peak = lastPeak;
@@ -612,7 +711,7 @@ static Rect spectrumResetButton() {
               30};
 }
 
-static Rect spectrumLogButton() {
+static Rect spectrumConfigShortcutButton() {
   const int16_t gaugeX = static_cast<int16_t>(screenW() - 16 - 4);
   return Rect{static_cast<int16_t>(gaugeX - 68),
               static_cast<int16_t>(contentTop() + 44),
@@ -667,6 +766,124 @@ static int amplitudeY(int32_t value, int32_t fullScale) {
   return contentBottom() - static_cast<int>(normalized * (contentHeight() - 4));
 }
 
+static uint32_t histogramAtClamped(int index) {
+  if (index < 0) index = 0;
+  if (index >= HISTOGRAM_BINS) index = HISTOGRAM_BINS - 1;
+  return histogram[index];
+}
+
+static void buildSmoothedHistogram() {
+  for (uint16_t i = 0; i < HISTOGRAM_BINS; i++) {
+    const uint64_t weighted =
+        histogramAtClamped(i - 2) +
+        histogramAtClamped(i - 1) * 2ULL +
+        histogramAtClamped(i) * 4ULL +
+        histogramAtClamped(i + 1) * 2ULL +
+        histogramAtClamped(i + 2);
+    smoothedHistogram[i] = static_cast<uint32_t>(weighted / 10ULL);
+  }
+}
+
+static int spectrumCountY(uint32_t count, float logMax) {
+  if (count == 0 || histogramMax == 0) return contentBottom();
+
+  int height = 0;
+  if (settings.spectrumLogCounts && logMax > 0.0f) {
+    const float normalized = log10f(static_cast<float>(count) + 1.0f) / logMax;
+    height = static_cast<int>(normalized * static_cast<float>(contentHeight() - 5));
+  } else {
+    height = static_cast<int>((static_cast<uint64_t>(count) * (contentHeight() - 5)) /
+                              histogramMax);
+  }
+  if (height < 0) height = 0;
+  if (height > contentHeight() - 5) height = contentHeight() - 5;
+  return contentBottom() - height + 1;
+}
+
+static int spectrumBinValueX(float bin, int plotRight) {
+  if (bin < 0.0f) bin = 0.0f;
+  if (bin > static_cast<float>(HISTOGRAM_BINS)) bin = static_cast<float>(HISTOGRAM_BINS);
+
+  float normalized = bin / static_cast<float>(HISTOGRAM_BINS);
+  if (settings.spectrumLogX) {
+    normalized = log10f(1.0f + bin) / log10f(1.0f + static_cast<float>(HISTOGRAM_BINS));
+  }
+  return static_cast<int>(normalized * static_cast<float>(plotRight));
+}
+
+static int spectrumBinEdgeX(uint16_t edge, int plotRight) {
+  return spectrumBinValueX(static_cast<float>(edge), plotRight);
+}
+
+static int spectrumBinCenterX(uint16_t bin, int plotRight) {
+  const int x0 = spectrumBinEdgeX(bin, plotRight);
+  const int x1 = spectrumBinEdgeX(bin + 1, plotRight);
+  return (x0 + x1) / 2;
+}
+
+static void formatSpectrumXLabel(char *label, size_t size, uint16_t bin) {
+  if (settings.showEnergy && calibrationValid()) {
+    snprintf(label, size, "%.0f", energyFromBin(static_cast<float>(bin)));
+  } else {
+    snprintf(label, size, "%u", bin);
+  }
+}
+
+static bool peakTooClose(uint16_t a, uint16_t b) {
+  const int delta = static_cast<int>(a) - static_cast<int>(b);
+  return (delta < 0 ? -delta : delta) < PEAK_MIN_DISTANCE_BINS;
+}
+
+static void insertPeak(uint16_t bin, uint32_t height, uint16_t *peakBins,
+                       uint32_t *peakHeights, uint8_t &peakCount) {
+  for (uint8_t i = 0; i < peakCount; i++) {
+    if (peakTooClose(bin, peakBins[i])) {
+      if (height > peakHeights[i]) {
+        peakBins[i] = bin;
+        peakHeights[i] = height;
+      }
+      return;
+    }
+  }
+
+  if (peakCount < MAX_PEAK_MARKERS) {
+    peakBins[peakCount] = bin;
+    peakHeights[peakCount] = height;
+    peakCount++;
+    return;
+  }
+
+  uint8_t weakest = 0;
+  for (uint8_t i = 1; i < peakCount; i++) {
+    if (peakHeights[i] < peakHeights[weakest]) weakest = i;
+  }
+  if (height > peakHeights[weakest]) {
+    peakBins[weakest] = bin;
+    peakHeights[weakest] = height;
+  }
+}
+
+static uint8_t findSpectrumPeaks(uint16_t *peakBins, uint32_t *peakHeights) {
+  uint8_t peakCount = 0;
+  const uint32_t minPeak = histogramMax / 20U > 3U ? histogramMax / 20U : 3U;
+  const uint32_t minProminence = histogramMax / 50U > 1U ? histogramMax / 50U : 1U;
+
+  for (uint16_t i = PEAK_SHOULDER_SPAN; i < HISTOGRAM_BINS - PEAK_SHOULDER_SPAN; i++) {
+    const uint32_t y = smoothedHistogram[i];
+    if (y < minPeak) continue;
+    if (!(y >= smoothedHistogram[i - 1] && y > smoothedHistogram[i + 1])) continue;
+
+    const uint32_t leftShoulder = smoothedHistogram[i - PEAK_SHOULDER_SPAN];
+    const uint32_t rightShoulder = smoothedHistogram[i + PEAK_SHOULDER_SPAN];
+    const uint32_t shoulder = leftShoulder > rightShoulder ? leftShoulder : rightShoulder;
+    if (y <= shoulder + minProminence) continue;
+
+    insertPeak(i, y, peakBins, peakHeights, peakCount);
+  }
+
+  return peakCount;
+}
+
 static void drawSpectrum() {
   drawHeader("Spectrum");
   drawPlotFrame();
@@ -675,30 +892,62 @@ static void drawSpectrum() {
   const int gaugeX = screenW() - gaugeW - 4;
   const int plotRight = gaugeX - 6;
   const float logMax = log10f(static_cast<float>(histogramMax) + 1.0f);
-  for (uint16_t i = 0; i < HISTOGRAM_BINS; i++) {
-    const int x0 = static_cast<int>((static_cast<uint32_t>(i) * plotRight) / HISTOGRAM_BINS);
-    int x1 = static_cast<int>((static_cast<uint32_t>(i + 1) * plotRight) / HISTOGRAM_BINS);
-    if (x1 <= x0) x1 = x0 + 1;
-    const int barWidth = x1 - x0;
-    int barHeight = 0;
-    if (histogramMax > 0 && histogram[i] > 0) {
-      if (settings.spectrumLogCounts && logMax > 0.0f) {
-        const float normalized = log10f(static_cast<float>(histogram[i]) + 1.0f) / logMax;
-        barHeight = static_cast<int>(normalized * static_cast<float>(contentHeight() - 5));
-      } else {
-        barHeight = static_cast<int>((static_cast<uint64_t>(histogram[i]) *
-                                      (contentHeight() - 5)) /
-                                     histogramMax);
+  buildSmoothedHistogram();
+
+  if (settings.showHistogram) {
+    for (uint16_t i = 0; i < HISTOGRAM_BINS; i++) {
+      int x0 = spectrumBinEdgeX(i, plotRight);
+      int x1 = spectrumBinEdgeX(i + 1, plotRight);
+      if (x1 <= x0) x1 = x0 + 1;
+      if (x0 >= plotRight) continue;
+      if (x1 > plotRight) x1 = plotRight;
+      const int barWidth = x1 - x0;
+      const int y = spectrumCountY(histogram[i], logMax);
+      const int barHeight = contentBottom() - y + 1;
+      if (histogram[i] > 0 && barHeight > 0 && barWidth > 0) {
+        lcd.fillRect(x0, contentBottom() - barHeight + 1, barWidth, barHeight, colorWave());
       }
-    }
-    if (barHeight > 0) {
-      lcd.fillRect(x0, contentBottom() - barHeight + 1, barWidth, barHeight, colorWave());
     }
   }
 
-  const int thresholdX = static_cast<int>(
-      (static_cast<float>(thresholdCounts()) / static_cast<float>(histogramFullScaleCounts())) *
-      plotRight);
+  if (settings.showSmoothCurve) {
+    int lastSmoothX = spectrumBinCenterX(0, plotRight);
+    int lastSmoothY = spectrumCountY(smoothedHistogram[0], logMax);
+    for (uint16_t i = 1; i < HISTOGRAM_BINS; i++) {
+      const int x = spectrumBinCenterX(i, plotRight);
+      const int y = spectrumCountY(smoothedHistogram[i], logMax);
+      lcd.drawLine(lastSmoothX, lastSmoothY, x, y, C_CYAN);
+      lastSmoothX = x;
+      lastSmoothY = y;
+    }
+  }
+
+  uint16_t peakBins[MAX_PEAK_MARKERS];
+  uint32_t peakHeights[MAX_PEAK_MARKERS];
+  const uint8_t peakCount = findSpectrumPeaks(peakBins, peakHeights);
+  lcd.setTextColor(colorAccent(), colorBg());
+  lcd.setTextDatum(textdatum_t::top_left);
+  for (uint8_t i = 0; i < peakCount; i++) {
+    const int x = spectrumBinCenterX(peakBins[i], plotRight);
+    const int y = spectrumCountY(peakHeights[i], logMax);
+    int markerTop = y - 5;
+    if (markerTop < contentTop() + 2) markerTop = contentTop() + 2;
+    lcd.drawFastVLine(x, contentTop() + 2, 9, colorAccent());
+    lcd.drawLine(x - 3, contentTop() + 11, x, contentTop() + 15, colorAccent());
+    lcd.drawLine(x + 3, contentTop() + 11, x, contentTop() + 15, colorAccent());
+    lcd.drawFastVLine(x, markerTop, 11, colorAccent());
+    char label[8];
+    formatSpectrumXLabel(label, sizeof(label), peakBins[i]);
+    int labelX = x - 8;
+    if (labelX < 2) labelX = 2;
+    if (labelX > plotRight - 20) labelX = plotRight - 20;
+    lcd.drawString(label, labelX, contentTop() + 17);
+  }
+
+  const float thresholdBin = (static_cast<float>(thresholdCounts()) /
+                              static_cast<float>(histogramFullScaleCounts())) *
+                             static_cast<float>(HISTOGRAM_BINS);
+  const int thresholdX = spectrumBinValueX(thresholdBin, plotRight);
   if (thresholdX >= 0 && thresholdX < plotRight) {
     lcd.drawFastVLine(thresholdX, contentTop(), contentHeight(), colorAxis());
   }
@@ -721,8 +970,7 @@ static void drawSpectrum() {
   lcd.setTextDatum(textdatum_t::top_left);
 
   drawButton(spectrumResetButton(), "Reset", false);
-  drawButton(spectrumLogButton(), settings.spectrumLogCounts ? "Log ON" : "Log OFF",
-             settings.spectrumLogCounts);
+  drawButton(spectrumConfigShortcutButton(), "Config", false);
 
   lcd.setTextColor(colorText(), colorBg());
   lcd.setCursor(4, contentBottom() - 14);
@@ -730,8 +978,11 @@ static void drawSpectrum() {
   lcd.setCursor(78, contentBottom() - 14);
   lcd.printf("Zoom %.0f%%", settings.spectrumMaxFraction * 100.0f);
   lcd.setCursor(162, contentBottom() - 14);
-  lcd.print(settings.spectrumLogCounts ? "LogY" : "LinY");
-  lcd.setCursor(206, contentBottom() - 14);
+  lcd.printf("%s %s", settings.spectrumLogX ? "LX" : "X",
+             settings.spectrumLogCounts ? "LY" : "Y");
+  lcd.setCursor(214, contentBottom() - 14);
+  lcd.print(settings.showEnergy && calibrationValid() ? "keV" : "bin");
+  lcd.setCursor(244, contentBottom() - 14);
   lcd.printf("%.1f CPS", pulsesPerSecond);
   drawNav();
 }
@@ -833,7 +1084,11 @@ static Rect settingButton(uint8_t row, uint8_t col) {
 }
 
 static Rect settingsPageButton() {
-  return Rect{200, 166, 110, 28};
+  return Rect{178, 166, 62, 28};
+}
+
+static Rect spectrumSettingsPageButton() {
+  return Rect{248, 166, 62, 28};
 }
 
 static Rect filterPageButton(uint8_t index) {
@@ -847,6 +1102,21 @@ static Rect trapAdjustButton(uint8_t row, uint8_t col) {
               static_cast<int16_t>(124 + row * 28),
               56,
               24};
+}
+
+static Rect spectrumOptionButton(uint8_t index) {
+  if (index < 4) {
+    return Rect{static_cast<int16_t>(8 + index * 78), 36, 72, 28};
+  }
+  const int16_t x = index == 4 ? 8 : (index == 5 ? 112 : 216);
+  return Rect{x, 68, 96, 28};
+}
+
+static Rect spectrumCalButton(uint8_t row, uint8_t col) {
+  return Rect{static_cast<int16_t>(col == 0 ? 224 : 274),
+              static_cast<int16_t>(105 + row * 23),
+              40,
+              21};
 }
 
 static void drawSettingRow(uint8_t row, const char *label, const char *value) {
@@ -877,6 +1147,7 @@ static void drawGeneralSettings() {
   drawSettingRow(3, "Pulse window", value);
 
   drawButton(settingsPageButton(), "Filters", false);
+  drawButton(spectrumSettingsPageButton(), "Spectrum", false);
 
   lcd.setTextColor(colorText(), colorBg());
   lcd.setCursor(10, 194);
@@ -920,11 +1191,58 @@ static void drawFilterSettings() {
   drawNav();
 }
 
+static void drawSpectrumCalRow(uint8_t row, const char *label, const char *value) {
+  const int y = 109 + row * 23;
+  lcd.setTextColor(colorText(), colorBg());
+  lcd.drawString(label, 10, y);
+  lcd.setTextColor(colorAccent(), colorBg());
+  lcd.drawString(value, 96, y);
+  drawButton(spectrumCalButton(row, 0), "-", false);
+  drawButton(spectrumCalButton(row, 1), "+", false);
+}
+
+static void drawSpectrumSettings() {
+  drawHeader("Spectrum");
+  lcd.fillRect(0, contentTop(), screenW(), contentHeight(), colorBg());
+
+  drawButton(spectrumOptionButton(0), "LogX", settings.spectrumLogX);
+  drawButton(spectrumOptionButton(1), "LogY", settings.spectrumLogCounts);
+  drawButton(spectrumOptionButton(2), "Bars", settings.showHistogram);
+  drawButton(spectrumOptionButton(3), "Curve", settings.showSmoothCurve);
+  drawButton(spectrumOptionButton(4), settings.showEnergy ? "Energy" : "Bins",
+             settings.showEnergy && calibrationValid());
+  drawButton(spectrumOptionButton(5), spectrumSettingsSaved ? "Saved" : "Save",
+             spectrumSettingsSaved);
+  drawButton(spectrumOptionButton(6), "Back", false);
+
+  char value[24];
+  snprintf(value, sizeof(value), "%u", static_cast<unsigned>(settings.calibBin1));
+  drawSpectrumCalRow(0, "P1 bin", value);
+  snprintf(value, sizeof(value), "%.0f keV", settings.calibEnergy1);
+  drawSpectrumCalRow(1, "P1 energy", value);
+  snprintf(value, sizeof(value), "%u", static_cast<unsigned>(settings.calibBin2));
+  drawSpectrumCalRow(2, "P2 bin", value);
+  snprintf(value, sizeof(value), "%.0f keV", settings.calibEnergy2);
+  drawSpectrumCalRow(3, "P2 energy", value);
+
+  lcd.setTextColor(calibrationValid() ? colorText() : C_RED, colorBg());
+  lcd.setCursor(10, 96);
+  if (calibrationValid()) {
+    lcd.printf("Cal %.0f..%.0f keV", energyFromBin(0.0f),
+               energyFromBin(static_cast<float>(HISTOGRAM_BINS - 1)));
+  } else {
+    lcd.print("Calibration needs two distinct points");
+  }
+  drawNav();
+}
+
 static void drawSettings() {
   if (settingsPage == 0) {
     drawGeneralSettings();
-  } else {
+  } else if (settingsPage == 1) {
     drawFilterSettings();
+  } else {
+    drawSpectrumSettings();
   }
 }
 
@@ -1009,6 +1327,64 @@ static void adjustSetting(uint8_t row, int8_t delta) {
   redrawRequested = true;
 }
 
+static void adjustSpectrumCalibration(uint8_t row, int8_t delta) {
+  spectrumSettingsSaved = false;
+  switch (row) {
+    case 0: {
+      int32_t value = static_cast<int32_t>(settings.calibBin1) + delta;
+      if (value < 0) value = 0;
+      if (value >= HISTOGRAM_BINS) value = HISTOGRAM_BINS - 1;
+      settings.calibBin1 = static_cast<uint16_t>(value);
+      break;
+    }
+    case 1:
+      settings.calibEnergy1 += static_cast<float>(delta);
+      break;
+    case 2: {
+      int32_t value = static_cast<int32_t>(settings.calibBin2) + delta;
+      if (value < 0) value = 0;
+      if (value >= HISTOGRAM_BINS) value = HISTOGRAM_BINS - 1;
+      settings.calibBin2 = static_cast<uint16_t>(value);
+      break;
+    }
+    case 3:
+      settings.calibEnergy2 += static_cast<float>(delta);
+      break;
+  }
+  clampSpectrumSettings();
+  redrawRequested = true;
+}
+
+static void toggleSpectrumOption(uint8_t index) {
+  spectrumSettingsSaved = false;
+  switch (index) {
+    case 0:
+      settings.spectrumLogX = !settings.spectrumLogX;
+      break;
+    case 1:
+      settings.spectrumLogCounts = !settings.spectrumLogCounts;
+      break;
+    case 2:
+      settings.showHistogram = !settings.showHistogram;
+      if (!settings.showHistogram && !settings.showSmoothCurve) settings.showSmoothCurve = true;
+      break;
+    case 3:
+      settings.showSmoothCurve = !settings.showSmoothCurve;
+      if (!settings.showHistogram && !settings.showSmoothCurve) settings.showHistogram = true;
+      break;
+    case 4:
+      settings.showEnergy = !settings.showEnergy;
+      break;
+    case 5:
+      saveSpectrumPreferences();
+      break;
+    case 6:
+      settingsPage = 0;
+      break;
+  }
+  redrawRequested = true;
+}
+
 static void handleTouch() {
   int32_t tx = 0;
   int32_t ty = 0;
@@ -1029,15 +1405,15 @@ static void handleTouch() {
     resetMeasurements();
     return;
   }
-  if (viewMode == VIEW_SPECTRUM && contains(spectrumLogButton(), x, y)) {
-    settings.spectrumLogCounts = !settings.spectrumLogCounts;
+  if (viewMode == VIEW_SPECTRUM && contains(spectrumConfigShortcutButton(), x, y)) {
+    viewMode = VIEW_SETTINGS;
+    settingsPage = 2;
     redrawRequested = true;
     return;
   }
   if (viewMode == VIEW_PULSE && contains(pulseBeepButton(), x, y)) {
     settings.beepEnabled = !settings.beepEnabled;
-    beepUntilMs = 0;
-    writeBeeper(0);
+    stopBeeper();
     redrawRequested = true;
     return;
   }
@@ -1056,6 +1432,11 @@ static void handleTouch() {
       redrawRequested = true;
       return;
     }
+    if (contains(spectrumSettingsPageButton(), x, y)) {
+      settingsPage = 2;
+      redrawRequested = true;
+      return;
+    }
     for (uint8_t row = 0; row < 4; row++) {
       if (contains(settingButton(row, 0), x, y)) {
         adjustSetting(row, -1);
@@ -1066,7 +1447,7 @@ static void handleTouch() {
         return;
       }
     }
-  } else if (viewMode == VIEW_SETTINGS) {
+  } else if (viewMode == VIEW_SETTINGS && settingsPage == 1) {
     for (uint8_t index = 0; index < 4; index++) {
       if (contains(filterPageButton(index), x, y)) {
         if (index == 3) {
@@ -1085,6 +1466,23 @@ static void handleTouch() {
       }
       if (contains(trapAdjustButton(row, 1), x, y)) {
         adjustSetting(row == 0 ? 7 : 8, 1);
+        return;
+      }
+    }
+  } else if (viewMode == VIEW_SETTINGS && settingsPage == 2) {
+    for (uint8_t index = 0; index < 7; index++) {
+      if (contains(spectrumOptionButton(index), x, y)) {
+        toggleSpectrumOption(index);
+        return;
+      }
+    }
+    for (uint8_t row = 0; row < 4; row++) {
+      if (contains(spectrumCalButton(row, 0), x, y)) {
+        adjustSpectrumCalibration(row, -1);
+        return;
+      }
+      if (contains(spectrumCalButton(row, 1), x, y)) {
+        adjustSpectrumCalibration(row, 1);
         return;
       }
     }
@@ -1148,6 +1546,7 @@ void setup() {
   Serial.begin(115200);
   delay(200);
 
+  loadSpectrumPreferences();
   setupStatusLed();
   setupBeeper();
   updateStatusLed();
@@ -1175,6 +1574,11 @@ void loop() {
   updatePulseRate();
   updateStatusLed();
   updateBeeper();
+  if (spectrumSettingsSaved &&
+      static_cast<int32_t>(spectrumSettingsSavedUntilMs - millis()) <= 0) {
+    spectrumSettingsSaved = false;
+    redrawRequested = true;
+  }
 
   bool pulseSeen = false;
   if (!paused) {

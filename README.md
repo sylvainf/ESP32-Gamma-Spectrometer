@@ -48,11 +48,14 @@ You can use SD Card GPIO (with an "sd card sniffer") if your CYD do not expose t
 
 The default screen shows the pulse-height histogram:
 
-- 192 energy bins for a finer trace
-- Runtime `Log ON/OFF` button for logarithmic or linear Y scaling
+- 192 energy bins for a fine trace
+- Cyan smoothed spectrum curve over the raw histogram
+- Automatic peak markers with bin numbers or calibrated energy values
+- Spectrum configuration page for `LogX`, `LogY`, raw bars, smoothed curve, and bin/energy display
 - `Reset` button to clear the spectrum and counters
+- `Config` button to jump directly to the spectrum configuration page
 - CPS gauge on the right with green to red scale depending on CPS
-- RGB LED follows the CPS rate and flashes blue briefly on each accepted pulse
+- RGB LED flashes blue briefly on each accepted pulse
 
 The horizontal scale is controlled by `Spectrum zoom` in the settings page. Changing the zoom clears the histogram because already-binned pulses cannot be redistributed correctly without storing the full pulse history.
 
@@ -80,6 +83,7 @@ The main settings page provides:
 - `Sample rate`: 48, 96, or 192 kHz (depending on your ADC card settings)
 - `Pulse window`: pulse capture length
 - `Filters`: opens the filter settings page
+- `Spectrum`: opens the spectrum display and calibration settings page
 
 The filter page provides buttons for:
 
@@ -94,6 +98,16 @@ It also lets you tune the trapezoidal filter:
 - `Gap`: flat-top gap in samples
 
 Changing filter parameters resets the measurements so the spectrum does not mix incompatible shaping settings.
+
+The spectrum page provides:
+
+- `LogX` and `LogY` display toggles
+- `Bars` and `Curve` display toggles
+- `Bins` / `Energy` display toggle
+- two-point calibration using `P1 bin`, `P1 energy`, `P2 bin`, and `P2 energy`
+- `Save` to store the spectrum display and calibration settings in ESP32 preferences
+
+With a valid two-point calibration, peak labels can be shown in keV instead of bin numbers.
 
 ## Filters
 
